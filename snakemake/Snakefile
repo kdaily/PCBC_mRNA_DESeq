@@ -1,0 +1,35 @@
+"""Run htseq and aggregate results to a matrix.
+
+"""
+import os
+
+BAMDIR="/home/kdaily/mount/belltown/external-data/DAT_114__PCBC_Data/mRNA/bam2"
+GTFFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/input/Hsapiens_UCSC_hg19_nochr.gtf"
+
+def getSamples(inputdir, suffix=".bam"):
+    filelist = os.listdir(inputdir)
+    filelist = filter(lambda x: x.endswith(suffix), filelist)
+    samplenames = map(lambda x: x.split(suffix)[0], filelist)
+    return list(samplenames)
+
+SAMPLES = getSamples(BAMDIR, suffix=".bam")
+
+rule all:
+     input: 'output/countmat/matrix.txt'
+
+rule aggregate:
+    """ Should make matrix.txt
+    """
+     input: expand('output/{sample}.txt', bamdir=BAMDIR, sample=SAMPLES)
+     output: 'output/countmat/matrix.txt'
+     shell: """touch {output}"""
+
+rule htseq:
+    """Run htseq
+
+    """
+
+    input: '%s/{prefix}.bam' % (BAMDIR,)
+    output: 'output/{prefix}.txt'
+    params: gtffile=GTFFILE
+    shell: """htseq-count --stranded=no -f bam -t CDS -i gene_id {input} {params.gtffile} 1> {output}"""
