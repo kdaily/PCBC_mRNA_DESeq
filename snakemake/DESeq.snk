@@ -1,4 +1,4 @@
-"""Run htseq and aggregate results to a matrix.
+"""Run htseq-count
 
 """
 import os
