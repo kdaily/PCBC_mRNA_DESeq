@@ -1,0 +1,94 @@
+# DESeq analysis of mRNA-seq data for PCBC
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(DESeq)
+library(dplyr)
+library(synapseClient)
+```
+
+```{r, cache=TRUE}
+# tblfileid <- "syn2823214"
+sampleTableFile <- "../snakemake/input/deseq_design.tsv"
+
+sampleTable <- tbl_df(read.delim(sampleTableFile))
+sampleTable$Gender <- NULL
+
+sampleTable <- filter(sampleTable, 
+                      # Gender != "", Gender != "unknown", 
+                      Originating_Lab != "N/A", Originating_Lab != "")
+```
+
+Read in the data, and estimate size factors and variance.
+
+From the docs for estimating size factors (normalization):
+
+> As a first processing step, we need to estimate the effective library size. This step is sometimes also called normalisation, even though there is no relation to normality or a normal distribution. The effective library size information is called the size factors vector, since the package only needs to know the relative library sizes. If the counts of non-differentially expressed genes in one sample are, on average, twice as high as in another (because the library was sequenced twice as deeply), the size factor for the first sample should be twice that of the other sample [1, 4]. The function estimateSizeFactors estimates the size factors from the count data.
+
+From the docs for estimating per-gene variance (dispersion):
+
+> The function estimateDispersions performs three steps. First, it estimates a dispersion value for each gene, then it fits a curve through the estimates. Finally, it assigns to each gene a dispersion value, using a choice between the per-gene estimate and the fitted value. To allow the user to inspect the intermediate steps, a fitInfo object is stored, which contains the per-gene estimate, the fitted curve and the values that will subsequently be used for inference.
+
+```{r, cache=TRUE}
+cds <- newCountDataSetFromHTSeqCount(as.data.frame(sampleTable),
+                                         directory="../snakemake/output")
+cds <- estimateSizeFactors(cds)
+cds <- estimateDispersions(cds)
+```
+
+Plot of dispersion estimates:
+
+> If a per-gene estimates lies below the regression line, we assume that this might indeed be sampling variance, and shift the estimate upwards to the value predicted by the regression line. If, however, the per-gene estimate lies above the line, we do not shift it downwards to the line, but rather keep it as is.
+
+```{r plotdispests}
+plotDispEsts(cds)
+```
+
+Fit two models - the full model regressing on `Originating_Lab` and `Diffname_short`, the other only on `Originating_Lab`. I'll then compare these two models for genes where including `Diffname_short` makes a difference.
+
+```{r fitmodels, warning=FALSE, message=FALSE, echo=FALSE, cache=TRUE}
+fit1 <- fitNbinomGLMs(cds, count ~ Originating_Lab + Diffname_short)
+fit0 <- fitNbinomGLMs(cds, count ~ Originating_Lab)
+```
+
+Perform $\chi^2$ test between two models to get $p$ values and Benjamini-Hochberg adjusted for $q$ values (FDR). However, these $q$ values are those in which any comparisons of a factor against all other samples are different, which is probably not what we want.
+
+```{r comparemodels}
+pvalsGLM <- nbinomGLMTest(fit1, fit0)
+padjGLM <- p.adjust(pvalsGLM, method="BH")
+deseqResults <- transform(fit1, pval=pvalsGLM, padj=padjGLM)
+deseqResults <- deseqResults[order(deseqResults$padj), ]
+```
+
+There are `r sum(padjGLM < 0.05, na.rm=TRUE)` differentially expressed genes with $q < 0.05$.
+
+```{r pvals}
+## Make results table with pvalues and adjusted p-values
+```
+
+For viz purposes, compute VST transformation on counts.
+
+```{r vst}
+cdsBlind <- estimateDispersions( cds, method="blind" )
+vsd <- varianceStabilizingTransformation( cdsBlind )
+```
+
+Compare a log_2 plus pseudocount transformation versus the variance stabilizing transformation.
+
+```{r comparevstlogpseudo}
+library("vsn")
+par(mfrow=c(1,2))
+notAllZero = (rowSums(counts(cds))>0)
+meanSdPlot(log2(counts(cds)[notAllZero, ] + 1), ylim = c(0,2.5))
+meanSdPlot(vsd[notAllZero, ], ylim = c(0,2.5))
+```
+
+## PCA of VST-transformed data colored by originating lab using 500 most variable genes
+
+```{r samplepcalab}
+print(plotPCA(vsd, intgroup=c("Originating_Lab")))
+```
+
+## PCA of VST-transformed data colored by Differentiation state using 500 most variable genes
+```{r samplepcadiffname}
+print(plotPCA(vsd, intgroup=c("Diffname_short")))
+```
