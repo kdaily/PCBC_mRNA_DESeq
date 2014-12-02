@@ -1,0 +1,211 @@
+# DESeq analysis of mRNA-seq data for PCBC
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(DESeq2)
+library(dplyr)
+library(plyr)
+library(reshape2)
+library(synapseClient)
+library(knitr)
+library(ggplot2)
+library("BiocParallel")
+register(MulticoreParam(8))
+
+source("./libs.R")
+synapseLogin()
+
+opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height=8)
+
+htseqfiledir <- "../snakemake/output"
+
+# Save myself to synapse
+fn <- File("./DESeq2_mRNA.Rmd", parentId="syn2838880")
+myself <- synStore(fn)
+
+```
+
+Read in the metadata from annotations on htseq-counts data:
+
+```{r readsamplemetadata}
+sampleTableQuery <- "select UID,name,id,C4_Cell_Line_ID,High_Confidence_Donor_ID,Originating_Lab,Gender,Diffname_short,Reprogramming_Gene_Combination,Reprogramming_Vector_Type,Cell_Line_Type,Cell_Type_of_Origin from file where fileType=='count' AND dataType=='mRNA'"
+
+sampleTable <- synapseQuery(sampleTableQuery)
+sampleTable <- tbl_df(sampleTable)
+
+colnames(sampleTable) <- gsub("file.", "", colnames(sampleTable))
+
+# Update a Donor ID column for normalization purposes
+sampleTable <- mutate(sampleTable,
+                      Donor_ID=factor(ifelse(High_Confidence_Donor_ID == "", 
+                                      C4_Cell_Line_ID, 
+                                      High_Confidence_Donor_ID)),
+                      C4_Cell_Line_ID=factor(C4_Cell_Line_ID),
+                      Originating_Lab=factor(Originating_Lab),
+                      Gender=factor(Gender),
+                      Diffname_short=factor(Diffname_short),
+                      Reprogramming_Gene_Combination=factor(Reprogramming_Gene_Combination),
+                      Reprogramming_Vector_Type=factor(Reprogramming_Vector_Type),
+                      Cell_Type_of_Origin=factor(Cell_Type_of_Origin),
+                      Cell_Line_Type=factor(Cell_Line_Type))
+
+# Reorder the columns for DESeq reading
+sampleTable <- sampleTable[, c("UID", "name", "C4_Cell_Line_ID", "Donor_ID" , "Gender", "Originating_Lab", 
+                               "Diffname_short", "Reprogramming_Gene_Combination", "Reprogramming_Vector_Type",
+                               "Cell_Line_Type", "Cell_Type_of_Origin")]
+
+# Covariates to consider
+covariates <- c("Gender", "Originating_Lab", "Cell_Type_of_Origin", "Cell_Line_Type",
+                "Reprogramming_Gene_Combination", "Reprogramming_Vector_Type")
+
+```
+
+The sample table is filtered by the mutually agreed upon list from 2014-11-25.
+
+```{r filtersamples, echo=TRUE, results='asis'}
+uniqueDonorSCFile <- synGet("syn2875170")
+uniqueDonorList <- read.delim(uniqueDonorSCFile@filePath, col.names="UID")
+sampleTable <- filter(sampleTable, UID %in% uniqueDonorList$UID)
+sampleTable <- droplevels(sampleTable)
+kable(sampleTable)
+```
+
+### DESeq analysis performed for each factor of interest
+
+The covariates under consideration are:
+
+`r paste(covariates, collapse=",")`
+
+#### Perform likelihood ratio tests for whole covariate
+
+First I compare a model (e.g., `count ~ Gender`) to a null model (e.g., `count ~ 1`) to assess an overall effect for each covaraite.
+
+```{r lrtmodels}
+allResLRT <- mlply(covariates, dodeseqLRT, sampleTable=as.data.frame(sampleTable), htseqfiledir=htseqfiledir)
+names(allResLRT) <- covariates
+```
+
+```{r nsigdf}
+alpha <- 0.1
+nsigdf <- ldply(allResLRT, 
+                function(x) data.frame(numSigGenes=nrow(subset(x, padj < alpha))),
+                .id="covariate")
+```
+
+Number of significantly differentially expressed genes for overall factor comparisons (likelihood ratio test between full model and reduced model, q < `r alpha`):
+
+```{r nsigtbl, echo=FALSE, results='asis'}
+nsigdf$X1 <- covariates
+colnames(nsigdf) <- c("covariate", "numSigGenes")
+kable(nsigdf)
+```
+
+```{r extractresultsLRT}
+finalResLRT <- ldply(allResLRT, function(y) transform(data.frame(y), 
+                                                      GeneSymbol=rownames(as.data.frame(y))),
+                     .id="LRT")
+finalResLRT$X1 <- rep(covariates, sapply(allResLRT, nrow))
+colnames(finalResLRT)[1] <- "LRT"
+```
+
+#### Perform pairwise tests within each covariate
+
+Enumerate all pairwise tests within each covariate (e.g., within `Reprogramming_Gene_Combination` we may compare `OSKM` and `OSKM-NLT`). Only groups within each covariate with at least 3 samples are considered.
+
+```{r pairwisetests}
+allRes <- mlply(covariates, dodeseqPairwise, sampleTable=as.data.frame(sampleTable), htseqfiledir="../snakemake/output")
+names(allRes) <- covariates
+```
+
+Extract all the results from all pairwise comparisons and build a table.
+
+```{r extractresults}
+finalRes <- llply(allRes, function (x) ldply(x, function(y) mutate(data.frame(y), 
+                                                                   GeneSymbol=rownames(as.data.frame(y))),
+                                             .id="pairwise"))
+finalRes <- ldply(finalRes, .id="covariate")
+```
+
+As a conservative adjustment, I also concatenate all test statistics (nominal p-values) and adjust them globally.
+
+```{r globalpadj}
+finalRes <- mutate(finalRes,
+                   pglobaladj=p.adjust(pvalue, method="BH"))
+```
+
+## Save data to Synapse
+
+```{r lrtpvals, message=FALSE, warning=FALSE, echo=FALSE}
+pvalueTableLRT <- dcast(finalResLRT, GeneSymbol ~ LRT, value.var="padj")
+write.csv(pvalueTableLRT, "./DESeq_pvalueTableLRT.csv", row.names=FALSE, quote=FALSE)
+
+fn <- File("./DESeq_pvalueTableLRT.csv", parentId="syn2838880")
+fn <- synStore(fn, executed=myself@properties$id, used="syn2822494")
+```
+
+A table of likelihood ratio test adjusted p-values is at `r fn@properties$id`.
+
+```{r pvalglobaladjtbl, message=FALSE, warning=FALSE, echo=FALSE}
+pvalueTableGlobalAdj <- dcast(finalRes, GeneSymbol ~ pairwise, value.var="pglobaladj")
+write.csv(pvalueTableGlobalAdj, "./DESeq_pvalueTableGlobalAdj.csv", row.names=FALSE, quote=FALSE)
+
+fn <- File("./DESeq_pvalueTableGlobalAdj.csv", parentId="syn2838880")
+fn <- synStore(fn, executed=myself@properties$id, used="syn2822494")
+```
+
+A table of global adjusted p-values is at `r fn@properties$id`.
+
+```{r pvaladjtbl, message=FALSE, warning=FALSE, echo=FALSE}
+pvalueTableAdj <- dcast(finalRes, GeneSymbol ~ pairwise, value.var="padj")
+write.csv(pvalueTableAdj, "./DESeq_pvalueTableAdj.csv", row.names=FALSE, quote=FALSE)
+
+fn <- File("./DESeq_pvalueTableAdj.csv", parentId="syn2838880")
+fn <- synStore(fn, executed=myself@properties$id, used="syn2822494")
+```
+
+A table of pairwise adjusted p-values is at `r fn@properties$id`.
+
+```{r fullrestbl, message=FALSE, warning=FALSE, echo=FALSE}
+# write.table(finalRes, "DESeq_finalResultsTable.tsv", sep="\t", row.names=FALSE, quote=TRUE)
+# fn <- File("./DESeq_finalResultsTable.tsv", parentId="syn2838880")
+# fn <- synStore(fn, executed=myself@properties$id, used="syn2822494")
+# # Full results table of the pairwise comparisons, including log fold changes is at `r fn@properties$id`. 
+```
+
+For viz purposes, compute regularized log transformation on counts.
+
+```{r rlog}
+dds <- DESeqDataSetFromHTSeqCount(as.data.frame(sampleTable),
+                                  directory=htseqfiledir,
+                                  design=~1)
+
+rld <- rlog(dds, blind=TRUE, fast=FALSE)
+```
+
+## Data visualization
+
+DESeq2 provides a novel method for data visualization (regularized log, or `rlog`) which deal with effects of heteroscedasticity endemic in expression assays.
+
+### PCA of rlog-transformed data colored by originating lab using 500 most variable genes
+```{r samplepcalab}
+plotPCA(rld, intgroup = c("Originating_Lab")) + theme_bw()
+```
+
+### PCA of rlog-transformed data colored by Gender using 500 most variable genes
+```{r samplepcagender}
+plotPCA(rld, intgroup = c("Gender")) + theme_bw() + theme(legend.position="top")
+```
+
+### PCA of rlog-transformed data colored by Cell_Line_Type using 500 most variable genes
+```{r samplecelllinetype}
+plotPCA(rld, intgroup = c("Cell_Line_Type")) + theme_bw() + theme(legend.position="top")
+```
+
+### PCA of rlog-transformed data colored by Cell_Type_of_Origin using 500 most variable genes
+```{r samplecelltypeoforigin}
+plotPCA(rld, intgroup = c("Cell_Type_of_Origin")) + theme_bw() + theme(legend.position="top")
+```
+
+### PCA of rlog-transformed data colored by Reprogramming_Vector_Type using 500 most variable genes
+```{r samplepcareprogvectortype}
+plotPCA(rld, intgroup = c("Reprogramming_Vector_Type")) + theme_bw() + theme(legend.position="top")
+```
