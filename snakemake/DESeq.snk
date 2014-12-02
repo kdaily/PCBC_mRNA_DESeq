@@ -9,8 +9,11 @@ PY2VIRTENV = "/home/kdaily/.virtualenvs/synapsetables/bin/activate"
 
 BAMDIR="/home/kdaily/mount/belltown/external-data/DAT_114__PCBC_Data/mRNA/bam2"
 # BAMDIR="/home/kdaily/mount/belltown/home/PCBC/C4_Raw_Data/mRNA/bam_Files"
-# GTFFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/input/Hsapiens_UCSC_hg19_nochr.gtf"
-GTFFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/input/gencode.v17.annotation_nochr.gtf"
+GTFFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/input/Hsapiens_UCSC_hg19_nochr.gtf"
+# GTFFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/input/gencode.v17.annotation_nochr.gtf"
+
+# Generally, this file's location
+SCRIPTFILE="/home/kdaily/Projects/PCBC/PCBC_mRNA_DESeq/snakemake/DESeq.snk"
 
 def getSamples(inputdir, suffix=".bam"):
     filelist = os.listdir(inputdir)
@@ -32,10 +35,10 @@ rule synstore:
     
     input: htseq='output/{prefix}.txt', bam='%s/{prefix}.bam' % (BAMDIR,)
     output: 'output/writesynapse/{prefix}.txt'
-    params: python2virtenv=PY2VIRTENV
-    threads: 3
+    params: python2virtenv=PY2VIRTENV,gtffile=GTFFILE,scriptfile=SCRIPTFILE
+    threads: 4
     shell: """source {params.python2virtenv}; \
-              synapse -s store {input.htseq} --parentId syn2887094 --limitSearch syn1773111 --used {input.bam} --executed syn2822522 &> {output} ; \
+              synapse -s store {input.htseq} --parentId syn2822494 --used {input.bam} {params.gtffile} --executed {params.scriptfile} &> {output} ; \
               deactivate
            """
 
